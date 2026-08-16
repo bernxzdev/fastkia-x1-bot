@@ -45,6 +45,36 @@ const commands = [
   new SlashCommandBuilder()
     .setName('ajuda')
     .setDescription('Mostra todos os comandos do Fastkia X1'),
+
+  new SlashCommandBuilder()
+    .setName('campeonato')
+    .setDescription('Gerencia campeonatos de x1 com inscrição e chaveamento automático')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addSubcommand(sub =>
+      sub.setName('criar')
+        .setDescription('Abre inscrições para um novo campeonato de x1')
+        .addStringOption(opt => opt.setName('nome').setDescription('Nome do campeonato').setRequired(true)))
+    .addSubcommand(sub =>
+      sub.setName('fechar')
+        .setDescription('Fecha as inscrições e gera o chaveamento automaticamente'))
+    .addSubcommand(sub =>
+      sub.setName('cancelar')
+        .setDescription('Cancela o campeonato ativo')),
+
+  new SlashCommandBuilder()
+    .setName('chaveamento')
+    .setDescription('Mostra o chaveamento (ou lista de inscritos) do campeonato ativo'),
+
+  new SlashCommandBuilder()
+    .setName('placar')
+    .setDescription('Registra o placar de uma partida do campeonato ativo')
+    .addStringOption(opt =>
+      opt.setName('partida').setDescription('Escolha a partida').setRequired(true).setAutocomplete(true))
+    .addIntegerOption(opt =>
+      opt.setName('placar1').setDescription('Placar do jogador 1').setRequired(true))
+    .addIntegerOption(opt =>
+      opt.setName('placar2').setDescription('Placar do jogador 2').setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ].map(cmd => cmd.toJSON());
 
 const rest = new REST().setToken(process.env.DISCORD_TOKEN);
