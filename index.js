@@ -10,6 +10,17 @@ const {
 } = require('discord.js');
 const supabase = require('./supabase');
 const { CORES, buildRankingPageEmbed, medalhaOuIndice } = require('./helpers');
+const {
+  getTorneioAtivo,
+  getInscritos,
+  buildInscricoesEmbed,
+  buildInscricoesRow,
+  criarPartidasRodada,
+  getTodasPartidas,
+  verificarEAvancarRodada,
+  buildChaveamentoEmbed,
+  registrarCampeao,
+} = require('./torneios');
 require('dotenv').config();
 
 // ---------- servidor HTTP de keep-alive (Render Free + UptimeRobot) ----------
@@ -30,7 +41,7 @@ client.once('ready', () => {
   });
 });
 
-// ---------- helpers de dados ----------
+// ---------- helpers de ranking geral ----------
 
 async function buscarRanking(guildId) {
   const { data, error } = await supabase
@@ -66,11 +77,43 @@ function rowRanking(page, totalPages) {
   );
 }
 
+async function avancarAteTravar(torneioId, rodadaInicial) {
+  let resultado = await verificarEAvancarRodada(torneioId, rodadaInicial);
+  while (resultado.avancou) {
+    resultado = await verificarEAvancarRodada(torneioId, resultado.novaRodada);
+  }
+  return resultado;
+}
+
 // ---------- autocomplete ----------
 
 client.on('interactionCreate', async (interaction) => {
-  if (interaction.isAutocomplete()) {
-    const focused = interaction.options.getFocused();
+  if (!interaction.isAutocomplete()) return;
+
+  const { commandName } = interaction;
+  const focused = interaction.options.getFocused(true);
+
+  if (commandName === 'placar' && focused.name === 'partida') {
+    const torneio = await getTorneioAtivo(interaction.guildId);
+    if (!torneio) return interaction.respond([]);
+
+    const { data } = await supabase
+      .from('x1_partidas')
+      .select('id, rodada, jogador1_username, jogador2_username')
+      .eq('torneio_id', torneio.id)
+      .is('vencedor_id', null)
+      .not('jogador2_id', 'is', null)
+      .order('rodada', { ascending: true });
+
+    const opcoes = (data || [])
+      .map(p => ({ name: `R${p.rodada}: ${p.jogador1_username} vs ${p.jogador2_username}`.slice(0, 100), value: String(p.id) }))
+      .filter(o => o.name.toLowerCase().includes(focused.value.toLowerCase()))
+      .slice(0, 25);
+
+    return interaction.respond(opcoes);
+  }
+
+  if (focused.name === 'campeonato') {
     const { data } = await supabase
       .from('x1_wins')
       .select('campeonato')
@@ -78,14 +121,53 @@ client.on('interactionCreate', async (interaction) => {
       .not('campeonato', 'is', null);
 
     const unicos = [...new Set((data || []).map(d => d.campeonato))]
-      .filter(c => c.toLowerCase().includes(focused.toLowerCase()))
+      .filter(c => c.toLowerCase().includes(focused.value.toLowerCase()))
       .slice(0, 25);
 
     return interaction.respond(unicos.map(c => ({ name: c, value: c })));
   }
+
+  return interaction.respond([]);
 });
 
-// ---------- botões (paginação do ranking) ----------
+// ---------- botão: entrar no campeonato ----------
+
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isButton()) return;
+  if (!interaction.customId.startsWith('entrar_x1_')) return;
+
+  const torneioId = interaction.customId.replace('entrar_x1_', '');
+
+  const { data: torneio } = await supabase.from('x1_torneios').select('*').eq('id', torneioId).maybeSingle();
+  if (!torneio || torneio.status !== 'inscricoes') {
+    return interaction.reply({ content: 'As inscrições para esse campeonato já foram encerradas.', ephemeral: true });
+  }
+
+  const { data: existente } = await supabase
+    .from('x1_inscritos')
+    .select('id')
+    .eq('torneio_id', torneioId)
+    .eq('user_id', interaction.user.id)
+    .maybeSingle();
+
+  if (existente) {
+    return interaction.reply({ content: 'Você já está inscrito nesse campeonato!', ephemeral: true });
+  }
+
+  await supabase.from('x1_inscritos').insert({
+    torneio_id: torneioId,
+    user_id: interaction.user.id,
+    username: interaction.user.username,
+  });
+
+  const inscritos = await getInscritos(torneioId);
+  const embed = buildInscricoesEmbed(torneio, inscritos);
+
+  await interaction.update({ embeds: [embed] });
+  await interaction.followUp({ content: '✅ Você entrou no campeonato!', ephemeral: true });
+});
+
+// ---------- botões: paginação do ranking ----------
 
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isButton()) return;
@@ -140,7 +222,7 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.reply({ embeds: [embed] });
     }
 
-    // /removervitoria (com confirmação)
+    // /removervitoria
     if (commandName === 'removervitoria') {
       const jogador = interaction.options.getUser('jogador');
 
@@ -316,19 +398,162 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.reply({ embeds: [embed] });
     }
 
+    // /campeonato criar | fechar | cancelar
+    if (commandName === 'campeonato') {
+      const sub = interaction.options.getSubcommand();
+
+      if (sub === 'criar') {
+        const nome = interaction.options.getString('nome');
+
+        const ativo = await getTorneioAtivo(guildId);
+        if (ativo) {
+          return interaction.reply({ content: `Já existe um campeonato ativo (**${ativo.nome}**). Use \`/campeonato cancelar\` antes de criar outro.`, ephemeral: true });
+        }
+
+        const { data: torneio } = await supabase.from('x1_torneios').insert({
+          guild_id: guildId,
+          nome,
+          status: 'inscricoes',
+          canal_id: interaction.channelId,
+          criado_por: interaction.user.username,
+        }).select().single();
+
+        const embed = buildInscricoesEmbed(torneio, []);
+        const row = buildInscricoesRow(torneio.id);
+
+        const msg = await interaction.reply({ embeds: [embed], components: [row], fetchReply: true });
+        await supabase.from('x1_torneios').update({ mensagem_id: msg.id }).eq('id', torneio.id);
+      }
+
+      if (sub === 'fechar') {
+        const torneio = await getTorneioAtivo(guildId);
+        if (!torneio || torneio.status !== 'inscricoes') {
+          return interaction.reply({ content: 'Não há campeonato com inscrições abertas.', ephemeral: true });
+        }
+
+        const inscritos = await getInscritos(torneio.id);
+        if (inscritos.length < 2) {
+          return interaction.reply({ content: 'É preciso pelo menos 2 inscritos para fechar as inscrições.', ephemeral: true });
+        }
+
+        await supabase.from('x1_torneios').update({ status: 'andamento' }).eq('id', torneio.id);
+        await criarPartidasRodada(torneio.id, 1, inscritos.map(i => ({ id: i.user_id, username: i.username })));
+
+        const resultado = await avancarAteTravar(torneio.id, 1);
+
+        if (resultado.finalizado) {
+          await registrarCampeao(torneio, resultado.vencedor);
+          const embed = new EmbedBuilder()
+            .setColor(CORES.ouro)
+            .setTitle(`🏆 ${torneio.nome} finalizado!`)
+            .setDescription(`Campeão: **${resultado.vencedor.vencedor_username}**`);
+          return interaction.reply({ embeds: [embed] });
+        }
+
+        const todas = await getTodasPartidas(torneio.id);
+        const porRodada = {};
+        for (const p of todas) {
+          porRodada[p.rodada] = porRodada[p.rodada] || [];
+          porRodada[p.rodada].push(p);
+        }
+
+        const embed = buildChaveamentoEmbed(torneio, porRodada);
+        await interaction.reply({ content: `Inscrições encerradas com **${inscritos.length}** participante(s). Chaveamento gerado!`, embeds: [embed] });
+      }
+
+      if (sub === 'cancelar') {
+        const torneio = await getTorneioAtivo(guildId);
+        if (!torneio) {
+          return interaction.reply({ content: 'Não há campeonato ativo para cancelar.', ephemeral: true });
+        }
+        await supabase.from('x1_torneios').update({ status: 'cancelado' }).eq('id', torneio.id);
+        await interaction.reply(`Campeonato **${torneio.nome}** foi cancelado.`);
+      }
+    }
+
+    // /chaveamento
+    if (commandName === 'chaveamento') {
+      const torneio = await getTorneioAtivo(guildId);
+      if (!torneio) {
+        return interaction.reply({ content: 'Não há campeonato ativo neste servidor.', ephemeral: true });
+      }
+
+      if (torneio.status === 'inscricoes') {
+        const inscritos = await getInscritos(torneio.id);
+        return interaction.reply({ embeds: [buildInscricoesEmbed(torneio, inscritos)] });
+      }
+
+      const todas = await getTodasPartidas(torneio.id);
+      const porRodada = {};
+      for (const p of todas) {
+        porRodada[p.rodada] = porRodada[p.rodada] || [];
+        porRodada[p.rodada].push(p);
+      }
+
+      await interaction.reply({ embeds: [buildChaveamentoEmbed(torneio, porRodada)] });
+    }
+
+    // /placar
+    if (commandName === 'placar') {
+      const partidaId = interaction.options.getString('partida');
+      const placar1 = interaction.options.getInteger('placar1');
+      const placar2 = interaction.options.getInteger('placar2');
+
+      if (placar1 === placar2) {
+        return interaction.reply({ content: 'Não pode dar empate em x1! Ajuste o placar.', ephemeral: true });
+      }
+
+      const { data: partida } = await supabase.from('x1_partidas').select('*').eq('id', partidaId).maybeSingle();
+      if (!partida || partida.vencedor_id) {
+        return interaction.reply({ content: 'Partida não encontrada ou já finalizada.', ephemeral: true });
+      }
+
+      const vencedorId = placar1 > placar2 ? partida.jogador1_id : partida.jogador2_id;
+      const vencedorUsername = placar1 > placar2 ? partida.jogador1_username : partida.jogador2_username;
+
+      await supabase.from('x1_partidas').update({
+        placar1, placar2, vencedor_id: vencedorId, vencedor_username: vencedorUsername,
+      }).eq('id', partidaId);
+
+      const { data: torneio } = await supabase.from('x1_torneios').select('*').eq('id', partida.torneio_id).single();
+
+      const embedPlacar = new EmbedBuilder()
+        .setColor(CORES.sucesso)
+        .setTitle('⚽ Placar registrado')
+        .setDescription(`**${partida.jogador1_username}** ${placar1} x ${placar2} **${partida.jogador2_username}**\nVencedor: **${vencedorUsername}**`);
+
+      await interaction.reply({ embeds: [embedPlacar] });
+
+      const resultado = await avancarAteTravar(partida.torneio_id, partida.rodada);
+
+      if (resultado.finalizado) {
+        await registrarCampeao(torneio, resultado.vencedor);
+        const embedFinal = new EmbedBuilder()
+          .setColor(CORES.ouro)
+          .setTitle(`🏆 ${torneio.nome} finalizado!`)
+          .setDescription(`Campeão do campeonato: **${resultado.vencedor.vencedor_username}** 🎉`);
+        await interaction.followUp({ embeds: [embedFinal] });
+      }
+    }
+
     // /ajuda
     if (commandName === 'ajuda') {
       const embed = new EmbedBuilder()
         .setColor(CORES.principal)
         .setTitle('🤖 Fastkia X1 — Comandos')
-        .setDescription('Bot de ranking para campeonatos de x1 no FIFA.')
+        .setDescription('Bot de ranking e campeonatos de x1 no FIFA.')
         .addFields(
-          { name: '/vitoria', value: 'Registra o vencedor de um campeonato (admin/mod).' },
+          { name: '/campeonato criar', value: 'Abre inscrições com botão de entrada (admin/mod).' },
+          { name: '/campeonato fechar', value: 'Fecha inscrições e gera o chaveamento automático (admin/mod).' },
+          { name: '/campeonato cancelar', value: 'Cancela o campeonato ativo (admin/mod).' },
+          { name: '/chaveamento', value: 'Mostra os inscritos ou o chaveamento atual.' },
+          { name: '/placar', value: 'Registra o resultado de uma partida do campeonato (admin/mod).' },
+          { name: '/vitoria', value: 'Registra manualmente o vencedor de um campeonato (admin/mod).' },
           { name: '/removervitoria', value: 'Remove a última vitória de um jogador, com confirmação (admin/mod).' },
           { name: '/ranking', value: 'Mostra o ranking geral, com paginação.' },
           { name: '/perfil', value: 'Mostra o total de títulos e posição de um jogador.' },
-          { name: '/historico', value: 'Lista as últimas vitórias registradas, com filtro por campeonato.' },
-          { name: '/estatisticas', value: 'Números gerais do servidor: maior campeão, campeonato mais disputado, etc.' }
+          { name: '/historico', value: 'Lista as últimas vitórias registradas.' },
+          { name: '/estatisticas', value: 'Números gerais do servidor.' }
         )
         .setFooter({ text: 'Fastkia X1' });
 
